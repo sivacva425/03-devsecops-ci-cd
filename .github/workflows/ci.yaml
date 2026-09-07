@@ -1,0 +1,67 @@
+name: DevSecOps Pipeline
+on:
+  push:
+    branches: [main]
+    paths: ['src/**']
+
+jobs:
+  build-and-secure-ship:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies, Lint, and Test
+        run: |
+          pip install flake8 bandit pytest
+          pip install -r src/requirements.txt
+          PYTHONPATH=. pytest tests/
+          flake8 src/ --ignore=E302,W391
+
+      - name: SAST Scan (Bandit)
+        run: bandit -r src/
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::<YOUR_ACCOUNT_ID>:role/github-actions-ecr-deployer-role
+          aws-region: us-west-2
+
+      - name: Build and Push to ECR
+        run: |
+          docker build -t <YOUR_ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/production-app:${{ github.sha }} .
+          docker push <YOUR_ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/production-app:${{ github.sha }}
+
+      - name: Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '<YOUR_ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/production-app:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Update GitOps Infrastructure Repo (The Bridge)
+        run: |
+          git clone https://github-actions[bot]:${{ secrets.INFRA_REPO_PAT }}@github.com/sivacva425/git-ops-repo.git
+          cd git-ops-repo
+          sed -i "s/tag: .*/tag: \"${{ github.sha }}\"/" helm-charts/web-app/values.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(gitops): update image tag to ${{ github.sha }} [skip ci]"
+          git push
